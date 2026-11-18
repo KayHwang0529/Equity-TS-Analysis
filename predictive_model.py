@@ -84,14 +84,17 @@ import numpy as np
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.optimizers.legacy import Adam
-from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.optimizers import Adam
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 
 # ─── Config ───────────────────────────────────────────────────────────────────
+# The model predicts next-day RETURNS rather than price levels. Price levels trend
+# out of the training range, so a scaler fit on training prices extrapolates badly
+# on the test period. Returns are roughly stationary, so the scaler stays valid.
 
-FEATURES = ["open", "high", "low", "close", "volume"]
-TARGET_COL = "close"
+FEATURES = ["r_open", "r_high", "r_low", "r_close", "d_log_volume"]
+TARGET_COL = "r_close"     # next-day close-to-close return
 SEQUENCE_LEN = 30          # look-back window (days)
 TRAIN_RATIO = 0.80
 BATCH_SIZE = 32
@@ -101,12 +104,12 @@ DROPOUT_RATE = 0.2
 LEARNING_RATE = 1e-3
 
 # Set a single stock symbol to train, or None to iterate over ALL files --> can analyse any specific stock by changing this variable
-STOCK_SYMBOL = "AXISBANK"  # e.g. "AXISBANK" | None = run all
+STOCK_SYMBOL = None  # e.g. "AXISBANK" | None = run all
 
 # ─── Data Cleaning  ─────────────────────────────────────────────────────────────
 
 def load_and_resample(filepath: Path) -> pd.DataFrame:
-    """Load minute-level CSV and resample to daily OHLCV."""
+    """Load minute-level CSV, resample to daily OHLCV, and add return features."""
     df = pd.read_csv(filepath, parse_dates=["date"])
     df = df.dropna(subset=["date"]).set_index("date").sort_index()
     daily = df.resample("D").agg(
@@ -116,40 +119,44 @@ def load_and_resample(filepath: Path) -> pd.DataFrame:
         close=("close", "last"),
         volume=("volume", "sum"),
     ).dropna()
-    return daily
+    daily = daily[daily["volume"] > 0]
+
+    # Each price is expressed relative to the previous trading day's close.
+    prev_close = daily["close"].shift(1)
+    daily["r_open"]  = daily["open"]  / prev_close - 1
+    daily["r_high"]  = daily["high"]  / prev_close - 1
+    daily["r_low"]   = daily["low"]   / prev_close - 1
+    daily["r_close"] = daily["close"] / prev_close - 1
+    daily["d_log_volume"] = np.log1p(daily["volume"]).diff()
+    return daily.dropna()
 
 
 def make_sequences(arr: np.ndarray, seq_len: int):
-    """Slide a window over arr to create (X, y) pairs for LSTM."""
+    """Slide a window over arr to create (X, y) pairs for LSTM.
+    X[i] holds days i..i+seq_len-1 and y[i] is the return on day i+seq_len."""
     X, y = [], []
     for i in range(len(arr) - seq_len):
         X.append(arr[i : i + seq_len])
         y.append(arr[i + seq_len, FEATURES.index(TARGET_COL)])
     # return X as (n_samples, seq_len, n_features) and y as column vector (n_samples, 1)
-    print(X)
     return np.array(X), np.array(y).reshape(-1, 1)
 
 
 def split_and_scale(daily: pd.DataFrame):
-    """Scale features, build sequences, and split into train/test sets."""
+    """Scale features (fit on training rows only), build sequences, and split chronologically."""
     values = daily[FEATURES].values.astype(np.float32)
     split_idx = int(len(values) * TRAIN_RATIO)
-    train_raw = values[:split_idx]
-    test_raw = values[split_idx:]
 
-    scaler = MinMaxScaler()
-    train_scaled = scaler.fit_transform(train_raw)
-    test_scaled = scaler.transform(test_raw)
+    scaler = StandardScaler()
+    scaler.fit(values[:split_idx])
+    scaled = scaler.transform(values)
 
-    full_scaled = np.concatenate([train_scaled, test_scaled], axis=0)
-    X_train, y_train = make_sequences(train_scaled, SEQUENCE_LEN)
-    X_test,  y_test  = make_sequences(
-        full_scaled[split_idx - SEQUENCE_LEN :], SEQUENCE_LEN
-    )
+    X_train, y_train = make_sequences(scaled[:split_idx], SEQUENCE_LEN)
+    X_test,  y_test  = make_sequences(scaled[split_idx - SEQUENCE_LEN :], SEQUENCE_LEN)
 
-    close_scaler = MinMaxScaler()
-    close_scaler.fit(train_raw[:, [FEATURES.index(TARGET_COL)]])
-    return X_train, y_train, X_test, y_test, scaler, close_scaler, split_idx
+    t = FEATURES.index(TARGET_COL)
+    target_mean, target_std = scaler.mean_[t], scaler.scale_[t]
+    return X_train, y_train, X_test, y_test, (target_mean, target_std), split_idx
 
 
 # ─── Model ────────────────────────────────────────────────────────────────────
@@ -159,7 +166,7 @@ def build_lstm_model(seq_len: int, n_features: int) -> tf.keras.Model:
         [
             Input(shape=(seq_len, n_features)),
             LSTM(LSTM_UNITS[0], return_sequences=True),
-        Dropout(DROPOUT_RATE),
+            Dropout(DROPOUT_RATE),
             LSTM(LSTM_UNITS[1], return_sequences=False),
             Dropout(DROPOUT_RATE),
             Dense(32, activation="relu"),
@@ -184,7 +191,7 @@ def train_model(model, X_train, y_train):
         X_train, y_train,
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
-        validation_split=0.15,
+        validation_split=0.15,   # Keras takes the LAST 15% of training data, so validation stays chronological
         callbacks=callbacks,
         verbose=0,
     )
@@ -193,22 +200,32 @@ def train_model(model, X_train, y_train):
 
 # ─── Evaluation & plotting ────────────────────────────────────────────────────
 
-def evaluate_and_plot(model, X_test, y_test, close_scaler, daily, split_idx, symbol, history):
-    """Inverse-transform predictions, print metrics, and save charts."""
-    y_pred_scaled = model.predict(X_test, verbose=0).flatten()
-    y_pred = close_scaler.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
-    y_true = close_scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
-
+def price_metrics(y_true, y_pred):
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     mae  = mean_absolute_error(y_true, y_pred)
     mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-8))) * 100
+    return rmse, mae, mape
 
 
-    print(f"  {symbol:20s}  |  RMSE {rmse:8.3f}  MAE {mae:8.3f}  MAPE {mape:.2f}%")
+def evaluate_and_plot(model, X_test, y_test, target_stats, daily, split_idx, symbol, history):
+    """Turn predicted returns into prices, compare with a naive random-walk baseline, and plot."""
+    mean, std = target_stats
+    r_pred = model.predict(X_test, verbose=0).flatten() * std + mean
+    r_true = y_test.flatten() * std + mean
 
+    closes = daily["close"].values
+    prev_close = closes[split_idx - 1 : split_idx - 1 + len(r_true)]   # last known close before each test day
+    y_true = closes[split_idx : split_idx + len(r_true)]
+    y_pred = prev_close * (1 + r_pred)
+    y_naive = prev_close                                                # random walk: tomorrow = today
 
-    # The first prediction corresponds to the day at `split_idx` (first day after training),
-    # because test sequences were created from `full_scaled[split_idx - SEQUENCE_LEN:]`.
+    rmse, mae, mape = price_metrics(y_true, y_pred)
+    n_rmse, n_mae, n_mape = price_metrics(y_true, y_naive)
+    hit_rate = np.mean(np.sign(r_pred) == np.sign(r_true)) * 100
+
+    print(f"  {symbol:12s} | LSTM RMSE {rmse:9.2f} MAE {mae:9.2f} MAPE {mape:5.2f}% "
+          f"| Naive RMSE {n_rmse:9.2f} MAE {n_mae:9.2f} MAPE {n_mape:5.2f}% | direction {hit_rate:5.1f}%")
+
     test_dates = daily.index[split_idx : split_idx + len(y_true)]
 
     fig, axes = plt.subplots(2, 1, figsize=(14, 8))
@@ -217,15 +234,15 @@ def evaluate_and_plot(model, X_test, y_test, close_scaler, daily, split_idx, sym
     ax = axes[0]
     ax.plot(test_dates, y_true, label="Actual Close",    color="steelblue",  linewidth=1.5)
     ax.plot(test_dates, y_pred, label="Predicted Close", color="darkorange", linewidth=1.5, linestyle="--")
-    ax.set_title(f"Test Set  |  RMSE={rmse:.3f}  MAE={mae:.3f}  MAPE={mape:.2f}%")
-    ax.set_ylabel("Price (\u20b9)")
+    ax.set_title(f"Test Set  |  LSTM MAPE={mape:.2f}%  vs  naive MAPE={n_mape:.2f}%")
+    ax.set_ylabel("Price (₹)")
     ax.legend()
     ax.grid(alpha=0.3)
 
     ax2 = axes[1]
     ax2.plot(history.history["loss"],     label="Train Loss", color="steelblue")
     ax2.plot(history.history["val_loss"], label="Val Loss",   color="darkorange")
-    ax2.set_title("Training / Validation Loss (MSE)")
+    ax2.set_title("Training / Validation Loss (MSE, scaled returns)")
     ax2.set_xlabel("Epoch")
     ax2.set_ylabel("Loss")
     ax2.legend()
@@ -233,7 +250,9 @@ def evaluate_and_plot(model, X_test, y_test, close_scaler, daily, split_idx, sym
 
     plt.tight_layout()
     plt.show()
-    return {"symbol": symbol, "rmse": rmse, "mae": mae, "mape": mape}
+    return {"symbol": symbol, "rmse": rmse, "mae": mae, "mape": mape,
+            "naive_rmse": n_rmse, "naive_mae": n_mae, "naive_mape": n_mape,
+            "direction_acc": hit_rate, "test_days": len(y_true)}
 
 
 # ─── Per-stock runner ─────────────────────────────────────────────────────────
@@ -247,7 +266,7 @@ def run_for_file(filepath: Path):
         print(f"  \u26a0  Not enough data ({len(daily)} days). Skipping.")
         return None
 
-    X_train, y_train, X_test, y_test, scaler, close_scaler, split_idx = split_and_scale(daily)
+    X_train, y_train, X_test, y_test, target_stats, split_idx = split_and_scale(daily)
     print(
         f"  Train sequences: {len(X_train):,}  |  "
         f"Test sequences: {len(X_test):,}  |  "
@@ -260,7 +279,7 @@ def run_for_file(filepath: Path):
     print(f"  Training complete ({len(history.history['loss'])} epochs).")
 
     result = evaluate_and_plot(
-        model, X_test, y_test, close_scaler, daily, split_idx, symbol, history
+        model, X_test, y_test, target_stats, daily, split_idx, symbol, history
     )
 
     return result
@@ -295,7 +314,9 @@ if __name__ == "__main__":
 
     if results:
         summary = pd.DataFrame(results).set_index("symbol")
-        print(summary.to_string())
+        print(summary.round(3).to_string())
+        print(f"\nMedian MAPE  LSTM {summary['mape'].median():.2f}%  vs  naive {summary['naive_mape'].median():.2f}%")
+        print(f"LSTM beats naive on RMSE for {(summary['rmse'] < summary['naive_rmse']).sum()} of {len(summary)} stocks")
 
 
 # %%
